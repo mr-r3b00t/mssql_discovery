@@ -3,15 +3,24 @@
     MSSQL Security Audit Tool - Discovers SQL Servers and checks for dangerous configurations.
 
 .DESCRIPTION
-    1. Enumerates servers from Active Directory (or uses provided list)
-    2. Discovers MSSQL instances
-    3. Checks dangerous configurations (xp_cmdshell, CLR, etc.)
-    4. Inventories databases, logins, and jobs
+    1. Interactive menu for easy operation (or use parameters for automation)
+    2. Enumerates servers from Active Directory (or uses provided list)
+    3. Discovers MSSQL instances
+    4. Checks dangerous configurations (xp_cmdshell, CLR, etc.)
+    5. Inventories databases, logins, and jobs
+    6. Generates HTML report with risk explanations
 
 .EXAMPLE
-    .\Invoke-MSSQLAudit.ps1 -Verbose
+    .\Invoke-MSSQLAudit.ps1
+    Launches interactive menu to choose scan mode
+
+.EXAMPLE
     .\Invoke-MSSQLAudit.ps1 -ServerList @("SQL01", "SQL02")
+    Directly audits specified servers (no menu)
+
+.EXAMPLE
     .\Invoke-MSSQLAudit.ps1 -Credential (Get-Credential) -OutputPath "C:\Audits"
+    Scans domain with SQL authentication
 #>
 
 [CmdletBinding()]
@@ -385,6 +394,105 @@ ORDER BY d.name
 #endregion
 
 #region Main Script
+
+function Show-Menu {
+    Clear-Host
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "       MSSQL Security Audit Tool" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  [1] Scan entire domain for SQL Servers"
+    Write-Host "  [2] Audit a single server"
+    Write-Host "  [3] Audit multiple servers (comma-separated)"
+    Write-Host "  [Q] Quit"
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Cyan
+}
+
+function Get-UserChoice {
+    $servers = @()
+    
+    while ($true) {
+        Show-Menu
+        $selection = Read-Host "Select an option"
+        
+        switch ($selection.ToUpper()) {
+            "1" {
+                Write-Host ""
+                Write-Host "Will scan domain for SQL Servers..." -ForegroundColor Yellow
+                return @{ Mode = "Domain"; Servers = @() }
+            }
+            "2" {
+                Write-Host ""
+                $server = Read-Host "Enter server name or IP"
+                if ([string]::IsNullOrWhiteSpace($server)) {
+                    Write-Host "No server specified. Please try again." -ForegroundColor Red
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+                return @{ Mode = "Single"; Servers = @($server.Trim()) }
+            }
+            "3" {
+                Write-Host ""
+                Write-Host "Enter server names separated by commas"
+                Write-Host "Example: SQL01, SQL02, SQL03" -ForegroundColor Gray
+                $serverInput = Read-Host "Servers"
+                if ([string]::IsNullOrWhiteSpace($serverInput)) {
+                    Write-Host "No servers specified. Please try again." -ForegroundColor Red
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+                $serverList = $serverInput -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+                if ($serverList.Count -eq 0) {
+                    Write-Host "No valid servers specified. Please try again." -ForegroundColor Red
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+                return @{ Mode = "Multiple"; Servers = $serverList }
+            }
+            "Q" {
+                Write-Host "Exiting..." -ForegroundColor Yellow
+                exit
+            }
+            default {
+                Write-Host "Invalid option. Please try again." -ForegroundColor Red
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+}
+
+# Determine mode of operation
+$interactiveMode = $false
+
+if (-not $ServerList -and -not $PSBoundParameters.ContainsKey('ServerList')) {
+    # No servers specified via parameter - show interactive menu
+    $userChoice = Get-UserChoice
+    $interactiveMode = $true
+    
+    if ($userChoice.Mode -eq "Domain") {
+        $ServerList = $null  # Will trigger AD enumeration
+    } else {
+        $ServerList = $userChoice.Servers
+    }
+    
+    # Ask about credentials
+    Write-Host ""
+    $useWinAuth = Read-Host "Use Windows Authentication? [Y/n]"
+    if ($useWinAuth -eq 'n' -or $useWinAuth -eq 'N') {
+        Write-Host "Enter SQL credentials:" -ForegroundColor Yellow
+        $Credential = Get-Credential -Message "SQL Server Authentication"
+    }
+    
+    # Ask about output path
+    Write-Host ""
+    $customPath = Read-Host "Output path (press Enter for current directory)"
+    if (-not [string]::IsNullOrWhiteSpace($customPath)) {
+        $OutputPath = $customPath
+    }
+    
+    Write-Host ""
+}
 
 Write-Log "=== MSSQL Security Audit Tool ===" -Level Success
 
@@ -792,8 +900,19 @@ Write-Host ""
 Write-Host "  Critical Issues:    $criticalCount" -ForegroundColor $(if ($criticalCount -gt 0) { "Red" } else { "Green" })
 Write-Host "  High Risk Issues:   $highCount" -ForegroundColor $(if ($highCount -gt 0) { "Yellow" } else { "Green" })
 Write-Host "  Backup Warnings:    $backupWarnings" -ForegroundColor $(if ($backupWarnings -gt 0) { "Yellow" } else { "Green" })
+Write-Host ""
+Write-Host "  Reports saved to:   $OutputPath" -ForegroundColor Cyan
 
 Write-Log "Audit complete!" -Level Success
+
+# Offer to open HTML report in interactive mode
+if ($interactiveMode -and (Test-Path $htmlPath)) {
+    Write-Host ""
+    $openReport = Read-Host "Open HTML report in browser? [Y/n]"
+    if ($openReport -ne 'n' -and $openReport -ne 'N') {
+        Start-Process $htmlPath
+    }
+}
 
 return $allResults
 
