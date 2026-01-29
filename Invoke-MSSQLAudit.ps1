@@ -42,18 +42,25 @@ function Write-Log {
 
 function Test-Port {
     param([string]$Computer, [int]$Port, [int]$Timeout = 3)
+    $tcp = $null
     try {
         $tcp = New-Object System.Net.Sockets.TcpClient
         $result = $tcp.BeginConnect($Computer, $Port, $null, $null)
         $success = $result.AsyncWaitHandle.WaitOne($Timeout * 1000, $false)
-        if ($success) { $tcp.EndConnect($result) }
-        $tcp.Close()
+        if ($success) { 
+            try { $tcp.EndConnect($result) } catch { }
+        }
         return $success
-    } catch { return $false }
+    } catch { 
+        return $false 
+    } finally {
+        if ($tcp) { $tcp.Close(); $tcp.Dispose() }
+    }
 }
 
 function Invoke-SQL {
     param([string]$Server, [string]$Query, [PSCredential]$Credential, [string]$Database = "master")
+    $conn = $null
     try {
         $cs = "Server=$Server;Database=$Database;Connection Timeout=10;"
         if ($Credential) {
@@ -69,11 +76,15 @@ function Invoke-SQL {
         $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
         $ds = New-Object System.Data.DataSet
         $adapter.Fill($ds) | Out-Null
-        $conn.Close()
         return $ds.Tables[0]
     } catch {
         Write-Verbose "SQL Error on $Server : $_"
         return $null
+    } finally {
+        if ($conn -and $conn.State -eq 'Open') { 
+            $conn.Close() 
+        }
+        if ($conn) { $conn.Dispose() }
     }
 }
 
@@ -131,6 +142,7 @@ function Find-SQLInstances {
     }
     
     # Try SQL Browser (UDP 1434)
+    $udp = $null
     try {
         $udp = New-Object System.Net.Sockets.UdpClient
         $udp.Client.ReceiveTimeout = 3000
@@ -138,20 +150,23 @@ function Find-SQLInstances {
         $udp.Send([byte]0x02, 1) | Out-Null
         $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
         $response = [Text.Encoding]::ASCII.GetString($udp.Receive([ref]$ep))
-        $udp.Close()
         
         # Parse instances
         if ($response -match "InstanceName;([^;]+).*?tcp;(\d+)") {
-            $matches = [regex]::Matches($response, "InstanceName;([^;]+).*?tcp;(\d+)")
-            foreach ($m in $matches) {
+            $regmatches = [regex]::Matches($response, "InstanceName;([^;]+).*?tcp;(\d+)")
+            foreach ($m in $regmatches) {
                 $name = $m.Groups[1].Value
-                $port = [int]$m.Groups[2].Value
-                if (-not ($instances | Where-Object { $_.Port -eq $port })) {
-                    $instances += [PSCustomObject]@{ Server = $Computer; Instance = $name; Port = $port }
+                $instPort = [int]$m.Groups[2].Value
+                if (-not ($instances | Where-Object { $_.Port -eq $instPort })) {
+                    $instances += [PSCustomObject]@{ Server = $Computer; Instance = $name; Port = $instPort }
                 }
             }
         }
-    } catch { }
+    } catch { 
+        # SQL Browser not available - this is normal, not an error
+    } finally {
+        if ($udp) { $udp.Close(); $udp.Dispose() }
+    }
     
     return $instances
 }
@@ -185,48 +200,49 @@ function Get-SQLSecurityConfig {
         LinkedServers = @()
     }
     
-    # Get server info
-    $info = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query @"
+    try {
+        # Get server info
+        $info = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query @"
 SELECT SERVERPROPERTY('ProductVersion') AS Version,
        SERVERPROPERTY('Edition') AS Edition,
        SYSTEM_USER AS CurrentUser,
        IS_SRVROLEMEMBER('sysadmin') AS IsSysAdmin
 "@
-    
-    if (-not $info) { return [PSCustomObject]$result }
-    
-    $result.Connected = $true
-    $result.Version = $info.Version
-    $result.Edition = $info.Edition
-    
-    # Get configurations
-    $configs = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query @"
+        
+        if (-not $info) { return [PSCustomObject]$result }
+        
+        $result.Connected = $true
+        $result.Version = $info.Version
+        $result.Edition = $info.Edition
+        
+        # Get configurations
+        $configs = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query @"
 SELECT name, CAST(value_in_use AS int) AS value
 FROM sys.configurations
 WHERE name IN ('xp_cmdshell','clr enabled','Ole Automation Procedures',
                'external scripts enabled','Ad Hoc Distributed Queries')
 "@
-    
-    if ($configs) {
-        foreach ($c in $configs) {
-            switch ($c.name) {
-                'xp_cmdshell' { $result.XPCmdShell = ($c.value -eq 1) }
-                'clr enabled' { $result.CLREnabled = ($c.value -eq 1) }
-                'Ole Automation Procedures' { $result.OLEAutomation = ($c.value -eq 1) }
-                'external scripts enabled' { $result.ExternalScripts = ($c.value -eq 1) }
-                'Ad Hoc Distributed Queries' { $result.AdHocQueries = ($c.value -eq 1) }
+        
+        if ($configs) {
+            foreach ($c in $configs) {
+                switch ($c.name) {
+                    'xp_cmdshell' { $result.XPCmdShell = ($c.value -eq 1) }
+                    'clr enabled' { $result.CLREnabled = ($c.value -eq 1) }
+                    'Ole Automation Procedures' { $result.OLEAutomation = ($c.value -eq 1) }
+                    'external scripts enabled' { $result.ExternalScripts = ($c.value -eq 1) }
+                    'Ad Hoc Distributed Queries' { $result.AdHocQueries = ($c.value -eq 1) }
+                }
             }
         }
-    }
-    
-    # Check SA account
-    $sa = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query @"
+        
+        # Check SA account
+        $sa = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query @"
 SELECT name, is_disabled FROM sys.sql_logins WHERE principal_id = 1
 "@
-    if ($sa) {
-        $result.SAEnabled = -not $sa.is_disabled
-        $result.SARenamed = ($sa.name -ne 'sa')
-    }
+        if ($sa) {
+            $result.SAEnabled = -not $sa.is_disabled
+            $result.SARenamed = ($sa.name -ne 'sa')
+        }
     
     # Get trustworthy databases
     $trustworthy = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query @"
@@ -240,13 +256,18 @@ SELECT name, data_source FROM sys.servers WHERE is_linked = 1
 "@
     if ($linked) { $result.LinkedServers = @($linked | ForEach-Object { "$($_.name) -> $($_.data_source)" }) }
     
+    } catch {
+        Write-Verbose "Error getting security config from $ServerInstance : $_"
+    }
+    
     return [PSCustomObject]$result
 }
 
 function Get-SQLDatabases {
     param([string]$ServerInstance, [PSCredential]$Credential)
     
-    $query = @"
+    try {
+        $query = @"
 SELECT 
     d.name AS DatabaseName,
     d.state_desc AS State,
@@ -261,24 +282,27 @@ SELECT
 FROM sys.databases d
 ORDER BY d.name
 "@
-    
-    $dbs = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query $query
-    if ($dbs) {
-        return $dbs | ForEach-Object {
-            [PSCustomObject]@{
-                ServerInstance = $ServerInstance
-                Database = $_.DatabaseName
-                State = $_.State
-                RecoveryModel = $_.RecoveryModel
-                CompatLevel = $_.CompatLevel
-                Owner = $_.Owner
-                SizeMB = [math]::Round($_.SizeMB, 2)
-                DataFiles = $_.DataFiles
-                LogFiles = $_.LogFiles
-                Encrypted = [bool]$_.Encrypted
-                Trustworthy = [bool]$_.Trustworthy
+        
+        $dbs = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query $query
+        if ($dbs) {
+            return $dbs | ForEach-Object {
+                [PSCustomObject]@{
+                    ServerInstance = $ServerInstance
+                    Database = $_.DatabaseName
+                    State = $_.State
+                    RecoveryModel = $_.RecoveryModel
+                    CompatLevel = $_.CompatLevel
+                    Owner = $_.Owner
+                    SizeMB = if ($_.SizeMB) { [math]::Round($_.SizeMB, 2) } else { 0 }
+                    DataFiles = $_.DataFiles
+                    LogFiles = $_.LogFiles
+                    Encrypted = [bool]$_.Encrypted
+                    Trustworthy = [bool]$_.Trustworthy
+                }
             }
         }
+    } catch {
+        Write-Verbose "Error getting databases from $ServerInstance : $_"
     }
     return @()
 }
@@ -286,8 +310,9 @@ ORDER BY d.name
 function Get-SQLLogins {
     param([string]$ServerInstance, [PSCredential]$Credential)
     
-    # Use FOR XML PATH for compatibility with SQL 2016 and earlier (STRING_AGG is 2017+)
-    $query = @"
+    try {
+        # Use FOR XML PATH for compatibility with SQL 2016 and earlier (STRING_AGG is 2017+)
+        $query = @"
 SELECT 
     sp.name AS LoginName,
     sp.type_desc AS LoginType,
@@ -303,20 +328,23 @@ FROM sys.server_principals sp
 WHERE sp.type IN ('S','U','G') AND sp.name NOT LIKE '##%' AND sp.name NOT LIKE 'NT %'
 ORDER BY sp.name
 "@
-    
-    $logins = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query $query
-    if ($logins) {
-        return $logins | ForEach-Object {
-            [PSCustomObject]@{
-                ServerInstance = $ServerInstance
-                Login = $_.LoginName
-                Type = $_.LoginType
-                Disabled = [bool]$_.Disabled
-                DefaultDB = $_.DefaultDB
-                ServerRoles = $_.ServerRoles
-                Created = $_.Created
+        
+        $logins = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query $query
+        if ($logins) {
+            return $logins | ForEach-Object {
+                [PSCustomObject]@{
+                    ServerInstance = $ServerInstance
+                    Login = $_.LoginName
+                    Type = $_.LoginType
+                    Disabled = [bool]$_.Disabled
+                    DefaultDB = $_.DefaultDB
+                    ServerRoles = $_.ServerRoles
+                    Created = $_.Created
+                }
             }
         }
+    } catch {
+        Write-Verbose "Error getting logins from $ServerInstance : $_"
     }
     return @()
 }
@@ -324,7 +352,8 @@ ORDER BY sp.name
 function Get-SQLJobs {
     param([string]$ServerInstance, [PSCredential]$Credential)
     
-    $query = @"
+    try {
+        $query = @"
 SELECT 
     j.name AS JobName,
     j.enabled AS Enabled,
@@ -339,20 +368,23 @@ OUTER APPLY (SELECT TOP 1 run_status FROM msdb.dbo.sysjobhistory
              WHERE job_id = j.job_id AND step_id = 0 ORDER BY instance_id DESC) h
 ORDER BY j.name
 "@
-    
-    $jobs = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query $query -Database "msdb"
-    if ($jobs) {
-        return $jobs | ForEach-Object {
-            [PSCustomObject]@{
-                ServerInstance = $ServerInstance
-                JobName = $_.JobName
-                Enabled = [bool]$_.Enabled
-                Owner = $_.Owner
-                Category = $_.Category
-                Steps = $_.Steps
-                LastStatus = $_.LastStatus
+        
+        $jobs = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query $query -Database "msdb"
+        if ($jobs) {
+            return $jobs | ForEach-Object {
+                [PSCustomObject]@{
+                    ServerInstance = $ServerInstance
+                    JobName = $_.JobName
+                    Enabled = [bool]$_.Enabled
+                    Owner = $_.Owner
+                    Category = $_.Category
+                    Steps = $_.Steps
+                    LastStatus = if ($_.LastStatus) { $_.LastStatus } else { "Unknown" }
+                }
             }
         }
+    } catch {
+        Write-Verbose "Error getting jobs from $ServerInstance : $_"
     }
     return @()
 }
@@ -360,7 +392,8 @@ ORDER BY j.name
 function Get-SQLBackupStatus {
     param([string]$ServerInstance, [PSCredential]$Credential)
     
-    $query = @"
+    try {
+        $query = @"
 SELECT 
     d.name AS DatabaseName,
     d.recovery_model_desc AS RecoveryModel,
@@ -373,20 +406,23 @@ WHERE d.database_id > 4
 GROUP BY d.name, d.recovery_model_desc
 ORDER BY d.name
 "@
-    
-    $backups = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query $query
-    if ($backups) {
-        return $backups | ForEach-Object {
-            [PSCustomObject]@{
-                ServerInstance = $ServerInstance
-                Database = $_.DatabaseName
-                RecoveryModel = $_.RecoveryModel
-                LastFullBackup = $_.LastFull
-                LastLogBackup = $_.LastLog
-                DaysSinceFull = $_.DaysSinceFull
-                Status = if ($null -eq $_.LastFull) { "NEVER" } elseif ($_.DaysSinceFull -gt 7) { "WARNING" } else { "OK" }
+        
+        $backups = Invoke-SQL -Server $ServerInstance -Credential $Credential -Query $query
+        if ($backups) {
+            return $backups | ForEach-Object {
+                [PSCustomObject]@{
+                    ServerInstance = $ServerInstance
+                    Database = $_.DatabaseName
+                    RecoveryModel = $_.RecoveryModel
+                    LastFullBackup = $_.LastFull
+                    LastLogBackup = $_.LastLog
+                    DaysSinceFull = $_.DaysSinceFull
+                    Status = if ($null -eq $_.LastFull) { "NEVER" } elseif ($_.DaysSinceFull -gt 7) { "WARNING" } else { "OK" }
+                }
             }
         }
+    } catch {
+        Write-Verbose "Error getting backup status from $ServerInstance : $_"
     }
     return @()
 }
@@ -528,30 +564,32 @@ foreach ($server in $servers) {
     
     Write-Log "Scanning $serverName..."
     
-    # Check if reachable
-    if (-not (Test-Connection -ComputerName $serverName -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
-        Write-Log "  Not reachable, skipping" -Level Warning
-        continue
-    }
-    
-    # Find SQL instances
-    $instances = Find-SQLInstances -Computer $serverName -Port $SQLPort
-    if ($instances.Count -eq 0) {
-        Write-Verbose "  No SQL instances found"
-        continue
-    }
-    
-    Write-Log "  Found $($instances.Count) SQL instance(s)" -Level Success
-    $sqlCount++
-    
-    foreach ($inst in $instances) {
-        $connStr = if ($inst.Port -eq 1433 -and $inst.Instance -eq "DEFAULT") { 
-            $serverName 
-        } else { 
-            "$serverName,$($inst.Port)" 
+    try {
+        # Check if reachable
+        if (-not (Test-Connection -ComputerName $serverName -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+            Write-Log "  Not reachable, skipping" -Level Warning
+            continue
         }
         
-        Write-Log "    Auditing: $connStr"
+        # Find SQL instances
+        $instances = Find-SQLInstances -Computer $serverName -Port $SQLPort
+        if ($instances.Count -eq 0) {
+            Write-Verbose "  No SQL instances found"
+            continue
+        }
+        
+        Write-Log "  Found $($instances.Count) SQL instance(s)" -Level Success
+        $sqlCount++
+        
+        foreach ($inst in $instances) {
+            try {
+                $connStr = if ($inst.Port -eq 1433 -and $inst.Instance -eq "DEFAULT") { 
+                    $serverName 
+                } else { 
+                    "$serverName,$($inst.Port)" 
+                }
+                
+                Write-Log "    Auditing: $connStr"
         
         # Security config
         $security = Get-SQLSecurityConfig -ServerInstance $connStr -Credential $Credential
@@ -572,27 +610,55 @@ foreach ($server in $servers) {
         } else {
             Write-Log "      Connection failed" -Level Warning
         }
+            } catch {
+                Write-Log "      Error auditing instance: $_" -Level Error
+            }
+        }
+    } catch {
+        Write-Log "  Error scanning server: $_" -Level Error
     }
+}
+
+# Check if any SQL servers were found
+if ($sqlCount -eq 0) {
+    Write-Log "No SQL Server instances found on any scanned servers" -Level Warning
 }
 
 # Export results
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 Write-Log "Exporting results..."
 
-if ($allResults.Security.Count -gt 0) {
-    $allResults.Security | Export-Csv "$OutputPath\SQL_Security_$timestamp.csv" -NoTypeInformation
+# Validate/create output path
+try {
+    if (-not (Test-Path $OutputPath)) {
+        New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+        Write-Log "Created output directory: $OutputPath" -Level Info
+    }
+} catch {
+    Write-Log "Failed to create output directory: $_" -Level Error
+    Write-Log "Using current directory instead" -Level Warning
+    $OutputPath = "."
 }
-if ($allResults.Databases.Count -gt 0) {
-    $allResults.Databases | Export-Csv "$OutputPath\SQL_Databases_$timestamp.csv" -NoTypeInformation
-}
-if ($allResults.Logins.Count -gt 0) {
-    $allResults.Logins | Export-Csv "$OutputPath\SQL_Logins_$timestamp.csv" -NoTypeInformation
-}
-if ($allResults.Jobs.Count -gt 0) {
-    $allResults.Jobs | Export-Csv "$OutputPath\SQL_Jobs_$timestamp.csv" -NoTypeInformation
-}
-if ($allResults.Backups.Count -gt 0) {
-    $allResults.Backups | Export-Csv "$OutputPath\SQL_Backups_$timestamp.csv" -NoTypeInformation
+
+# Export CSV files with error handling
+try {
+    if ($allResults.Security.Count -gt 0) {
+        $allResults.Security | Export-Csv "$OutputPath\SQL_Security_$timestamp.csv" -NoTypeInformation
+    }
+    if ($allResults.Databases.Count -gt 0) {
+        $allResults.Databases | Export-Csv "$OutputPath\SQL_Databases_$timestamp.csv" -NoTypeInformation
+    }
+    if ($allResults.Logins.Count -gt 0) {
+        $allResults.Logins | Export-Csv "$OutputPath\SQL_Logins_$timestamp.csv" -NoTypeInformation
+    }
+    if ($allResults.Jobs.Count -gt 0) {
+        $allResults.Jobs | Export-Csv "$OutputPath\SQL_Jobs_$timestamp.csv" -NoTypeInformation
+    }
+    if ($allResults.Backups.Count -gt 0) {
+        $allResults.Backups | Export-Csv "$OutputPath\SQL_Backups_$timestamp.csv" -NoTypeInformation
+    }
+} catch {
+    Write-Log "Error exporting CSV files: $_" -Level Error
 }
 
 # Generate HTML Report
@@ -885,8 +951,13 @@ $html += @"
 "@
 
 $htmlPath = "$OutputPath\SQL_Audit_Report_$timestamp.html"
-$html | Out-File -FilePath $htmlPath -Encoding UTF8
-Write-Log "HTML Report: $htmlPath" -Level Success
+try {
+    $html | Out-File -FilePath $htmlPath -Encoding UTF8
+    Write-Log "HTML Report: $htmlPath" -Level Success
+} catch {
+    Write-Log "Error saving HTML report: $_" -Level Error
+    $htmlPath = $null
+}
 
 # Summary
 Write-Host ""
