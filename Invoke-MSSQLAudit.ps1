@@ -277,6 +277,7 @@ ORDER BY d.name
 function Get-SQLLogins {
     param([string]$ServerInstance, [PSCredential]$Credential)
     
+    # Use FOR XML PATH for compatibility with SQL 2016 and earlier (STRING_AGG is 2017+)
     $query = @"
 SELECT 
     sp.name AS LoginName,
@@ -284,9 +285,11 @@ SELECT
     sp.is_disabled AS Disabled,
     sp.create_date AS Created,
     sp.default_database_name AS DefaultDB,
-    (SELECT STRING_AGG(r.name, ', ') FROM sys.server_role_members rm 
-     JOIN sys.server_principals r ON rm.role_principal_id = r.principal_id 
-     WHERE rm.member_principal_id = sp.principal_id) AS ServerRoles
+    STUFF((SELECT ', ' + r.name 
+           FROM sys.server_role_members rm 
+           JOIN sys.server_principals r ON rm.role_principal_id = r.principal_id 
+           WHERE rm.member_principal_id = sp.principal_id
+           FOR XML PATH('')), 1, 2, '') AS ServerRoles
 FROM sys.server_principals sp
 WHERE sp.type IN ('S','U','G') AND sp.name NOT LIKE '##%' AND sp.name NOT LIKE 'NT %'
 ORDER BY sp.name
@@ -515,7 +518,7 @@ $html = @"
         td { border: 1px solid #ddd; padding: 10px; }
         tr:nth-child(even) { background: #f9f9f9; }
         tr:hover { background: #f5f5f5; }
-        .badge { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 0.85em; font-weight: bold; }
+        .badge { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 0.85em; font-weight: bold; background: #ecf0f1; color: #333; }
         .badge-critical { background: #e74c3c; color: #fff; }
         .badge-high { background: #e67e22; color: #fff; }
         .badge-warning { background: #f1c40f; color: #333; }
@@ -650,8 +653,20 @@ foreach ($s in $allResults.Security) {
     $extBadge = if ($s.ExternalScripts) { '<span class="badge badge-high">ENABLED</span>' } else { '<span class="badge badge-ok">Disabled</span>' }
     $saBadge = if ($s.SAEnabled) { '<span class="badge badge-high">ENABLED</span>' } else { '<span class="badge badge-ok">Disabled</span>' }
     $saRenamed = if ($s.SARenamed) { '<span class="badge badge-ok">Yes</span>' } else { '<span class="badge badge-warning">No</span>' }
-    $trustworthy = if ($s.TrustworthyDBs.Count -gt 0) { '<span class="badge badge-high">' + ($s.TrustworthyDBs -join ", ") + '</span>' } else { "-" }
-    $linked = if ($s.LinkedServers.Count -gt 0) { $s.LinkedServers.Count } else { "-" }
+    
+    # Format trustworthy DBs as individual badges
+    if ($s.TrustworthyDBs.Count -gt 0) {
+        $trustworthy = ($s.TrustworthyDBs | ForEach-Object { '<span class="badge badge-high">' + $_ + '</span>' }) -join " "
+    } else {
+        $trustworthy = "-"
+    }
+    
+    # Format linked servers count with warning if present
+    if ($s.LinkedServers.Count -gt 0) {
+        $linked = '<span class="badge badge-warning">' + $s.LinkedServers.Count + ' linked</span>'
+    } else {
+        $linked = "-"
+    }
     
     $html += "<tr><td>$($s.ServerInstance)</td><td>$($s.Version)</td><td>$xpBadge</td><td>$clrBadge</td><td>$oleBadge</td><td>$extBadge</td><td>$saBadge</td><td>$saRenamed</td><td>$trustworthy</td><td>$linked</td></tr>`n"
 }
@@ -665,9 +680,19 @@ $html += @"
 "@
 
 foreach ($db in $allResults.Databases) {
+    # State badge
+    $stateBadge = switch ($db.State) {
+        "ONLINE" { '<span class="badge badge-ok">ONLINE</span>' }
+        "OFFLINE" { '<span class="badge badge-critical">OFFLINE</span>' }
+        "RESTORING" { '<span class="badge badge-warning">RESTORING</span>' }
+        "RECOVERING" { '<span class="badge badge-warning">RECOVERING</span>' }
+        "SUSPECT" { '<span class="badge badge-critical">SUSPECT</span>' }
+        "EMERGENCY" { '<span class="badge badge-critical">EMERGENCY</span>' }
+        default { '<span class="badge">' + $db.State + '</span>' }
+    }
     $encBadge = if ($db.Encrypted) { '<span class="badge badge-ok">Yes</span>' } else { "-" }
     $trustBadge = if ($db.Trustworthy) { '<span class="badge badge-high">Yes</span>' } else { "-" }
-    $html += "<tr><td>$($db.ServerInstance)</td><td>$($db.Database)</td><td>$($db.State)</td><td>$($db.RecoveryModel)</td><td>$($db.SizeMB)</td><td>$($db.Owner)</td><td>$encBadge</td><td>$trustBadge</td></tr>`n"
+    $html += "<tr><td>$($db.ServerInstance)</td><td>$($db.Database)</td><td>$stateBadge</td><td>$($db.RecoveryModel)</td><td>$($db.SizeMB)</td><td>$($db.Owner)</td><td>$encBadge</td><td>$trustBadge</td></tr>`n"
 }
 
 $html += @"
@@ -680,8 +705,26 @@ $html += @"
 
 foreach ($l in $allResults.Logins) {
     $statusBadge = if ($l.Disabled) { '<span class="badge badge-disabled">Disabled</span>' } else { '<span class="badge badge-ok">Active</span>' }
-    $roles = if ($l.ServerRoles) { $l.ServerRoles } else { "-" }
-    if ($roles -match "sysadmin") { $roles = $roles -replace "sysadmin", '<span class="badge badge-high">sysadmin</span>' }
+    
+    # Format roles - badge each one appropriately
+    if ($l.ServerRoles) {
+        $roleList = $l.ServerRoles -split ',\s*'
+        $formattedRoles = foreach ($role in $roleList) {
+            $role = $role.Trim()
+            switch -Wildcard ($role) {
+                "sysadmin" { '<span class="badge badge-critical">sysadmin</span>' }
+                "securityadmin" { '<span class="badge badge-high">securityadmin</span>' }
+                "serveradmin" { '<span class="badge badge-high">serveradmin</span>' }
+                "dbcreator" { '<span class="badge badge-warning">dbcreator</span>' }
+                "bulkadmin" { '<span class="badge badge-warning">bulkadmin</span>' }
+                default { '<span class="badge">' + $role + '</span>' }
+            }
+        }
+        $roles = $formattedRoles -join " "
+    } else {
+        $roles = "-"
+    }
+    
     $html += "<tr><td>$($l.ServerInstance)</td><td>$($l.Login)</td><td>$($l.Type)</td><td>$statusBadge</td><td>$roles</td><td>$($l.DefaultDB)</td></tr>`n"
 }
 
@@ -698,8 +741,10 @@ foreach ($j in $allResults.Jobs) {
     $statusBadge = switch ($j.LastStatus) {
         "Succeeded" { '<span class="badge badge-ok">Succeeded</span>' }
         "Failed" { '<span class="badge badge-critical">Failed</span>' }
-        "Unknown" { '<span class="badge badge-warning">Unknown</span>' }
-        default { $j.LastStatus }
+        "Retry" { '<span class="badge badge-warning">Retry</span>' }
+        "Canceled" { '<span class="badge badge-warning">Canceled</span>' }
+        "Unknown" { '<span class="badge badge-disabled">Unknown</span>' }
+        default { '<span class="badge">' + $j.LastStatus + '</span>' }
     }
     $html += "<tr><td>$($j.ServerInstance)</td><td>$($j.JobName)</td><td>$enabledBadge</td><td>$($j.Owner)</td><td>$($j.Steps)</td><td>$statusBadge</td></tr>`n"
 }
@@ -717,10 +762,10 @@ foreach ($b in $allResults.Backups) {
         "OK" { '<span class="badge badge-ok">OK</span>' }
         "WARNING" { '<span class="badge badge-warning">WARNING</span>' }
         "NEVER" { '<span class="badge badge-critical">NEVER</span>' }
-        default { $b.Status }
+        default { '<span class="badge">' + $b.Status + '</span>' }
     }
-    $lastFull = if ($b.LastFullBackup) { $b.LastFullBackup.ToString("yyyy-MM-dd HH:mm") } else { "-" }
-    $lastLog = if ($b.LastLogBackup) { $b.LastLogBackup.ToString("yyyy-MM-dd HH:mm") } else { "-" }
+    $lastFull = if ($b.LastFullBackup) { $b.LastFullBackup.ToString("yyyy-MM-dd HH:mm") } else { '<span style="color:#999">Never</span>' }
+    $lastLog = if ($b.LastLogBackup) { $b.LastLogBackup.ToString("yyyy-MM-dd HH:mm") } else { '<span style="color:#999">Never</span>' }
     $days = if ($null -eq $b.DaysSinceFull) { "-" } else { $b.DaysSinceFull }
     $html += "<tr><td>$($b.ServerInstance)</td><td>$($b.Database)</td><td>$($b.RecoveryModel)</td><td>$lastFull</td><td>$lastLog</td><td>$days</td><td>$statusBadge</td></tr>`n"
 }
