@@ -495,8 +495,8 @@ Write-Host "  Jobs:               $($allResults.Jobs.Count)"
 Write-Host ""
 
 # Security summary
-$critical = ($allResults.Security | Where-Object { $_.XPCmdShell }).Count
-$high = ($allResults.Security | Where-Object { $_.CLREnabled -or ($_.SAEnabled -and -not $_.SARenamed) }).Count
+$critical = @($allResults.Security | Where-Object { $_.XPCmdShell -eq $true }).Count
+$high = @($allResults.Security | Where-Object { $_.CLREnabled -eq $true -or $_.OLEAutomation -eq $true -or ($_.SAEnabled -eq $true -and $_.SARenamed -eq $false) -or $_.TrustworthyDBs.Count -gt 0 }).Count
 Write-Host "  Critical Issues:    $critical" -ForegroundColor $(if ($critical -gt 0) { "Red" } else { "Green" })
 Write-Host "  High Risk Issues:   $high" -ForegroundColor $(if ($high -gt 0) { "Yellow" } else { "Green" })
 
